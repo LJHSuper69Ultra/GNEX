@@ -95,7 +95,12 @@ static void throw_gne(const char *fmt, const char *arg){
     g_exit_code = 1;
     longjmp(g_toplevel, 1);
 }
-static void do_exit(void){ g_exit_code = 0; longjmp(g_toplevel, 1); }
+static void do_exit(void){ g_exit_code = 0; longjmp(g_toplevel, 2); }
+
+/* REPL(대화) 모드: 구문 오류가 프로세스를 해체하지 않고 프롬프트로 복귀하게 한다 */
+static int g_repl = 0;
+static jmp_buf g_parsejmp;
+static void repl_or_exit(void){ if(g_repl) longjmp(g_parsejmp, 1); exit(2); }
 
 /* ================================================================== 토큰 */
 typedef enum {
@@ -243,7 +248,7 @@ static void lex(const char *s, TokList *tl){
           const char *ops1="+-*/%<>=!(){}[],;:.";
           if(strchr(ops1,(char)c)){ char o[2]={(char)c,0}; Token t={0}; t.type=TK_OP; t.text=xstrdup(o); t.line=line; tok_push(tl,t); i++; continue; }
         }
-        fprintf(stderr,"안보 경고: %d번째 줄: 알 수 없는 글자 (0x%02x)\n",line,c); exit(2);
+        fprintf(stderr,"안보 경고: %d번째 줄: 알 수 없는 글자 (0x%02x)\n",line,c); repl_or_exit();
     }
     Token t={0}; t.type=TK_EOF; t.line=line; tok_push(tl,t);
 }
@@ -275,8 +280,8 @@ static Token *pcur(Parser *p){ return &p->t[p->i]; }
 static Token *padv(Parser *p){ return &p->t[p->i++]; }
 static int is_op(Parser *p,const char *v,int k){ Token *t=pk(p,k); return t->type==TK_OP && !strcmp(t->text,v); }
 static int eat_op(Parser *p,const char *v){ if(is_op(p,v,0)){ p->i++; return 1; } return 0; }
-static void expect_op(Parser *p,const char *v){ if(!eat_op(p,v)){ Token *t=pcur(p); fprintf(stderr,"안보 경고: %d번째 줄: '%s'가 와야 합니다 (받은 것: %s)\n",t->line,v,t->text?t->text:"?"); exit(2);} }
-static char *expect_ident(Parser *p){ Token *t=pcur(p); if(t->type!=TK_IDENT){ fprintf(stderr,"안보 경고: %d번째 줄: 이름이 와야 합니다\n",t->line); exit(2);} p->i++; return t->text; }
+static void expect_op(Parser *p,const char *v){ if(!eat_op(p,v)){ Token *t=pcur(p); fprintf(stderr,"안보 경고: %d번째 줄: '%s'가 와야 합니다 (받은 것: %s)\n",t->line,v,t->text?t->text:"?"); repl_or_exit();} }
+static char *expect_ident(Parser *p){ Token *t=pcur(p); if(t->type!=TK_IDENT){ fprintf(stderr,"안보 경고: %d번째 줄: 이름이 와야 합니다\n",t->line); repl_or_exit();} p->i++; return t->text; }
 static void end_stmt(Parser *p){ while(is_op(p,";",0)) p->i++; }
 
 static Node *parse_stmt(Parser *p);
@@ -323,7 +328,7 @@ static Node *parse_primary(Parser *p){
             break;
         default: break;
     }
-    fprintf(stderr,"안보 경고: %d번째 줄: 이해할 수 없는 표현\n",t->line); exit(2);
+    fprintf(stderr,"안보 경고: %d번째 줄: 이해할 수 없는 표현\n",t->line); repl_or_exit();
 }
 
 static Node *parse_postfix(Parser *p){
@@ -390,11 +395,11 @@ static Node *parse_class(Parser *p){
 }
 static Node *parse_func(Parser *p){
     int line=pcur(p)->line; p->i++;
-    if(pcur(p)->type==TK_FUNC_TO){ fprintf(stderr,"안보 경고: %d번째 줄: %s\n",line,SECURITY_WARNING); exit(2); }
+    if(pcur(p)->type==TK_FUNC_TO){ fprintf(stderr,"안보 경고: %d번째 줄: %s\n",line,SECURITY_WARNING); repl_or_exit(); }
     char *name=expect_ident(p);
-    if(name[0]!='K'){ fprintf(stderr,"안보 경고: %d번째 줄: 모든 함수 이름 앞에는 K를 꼭 붙여야 합니다 ('%s')\n",line,name); exit(2); }
+    if(name[0]!='K'){ fprintf(stderr,"안보 경고: %d번째 줄: 모든 함수 이름 앞에는 K를 꼭 붙여야 합니다 ('%s')\n",line,name); repl_or_exit(); }
     Node *f=nn(N_FUNC); f->s=name;
-    if(pcur(p)->type!=TK_FUNC_TO){ fprintf(stderr,"안보 경고: FUNC_TO 누락\n"); exit(2);} p->i++;
+    if(pcur(p)->type!=TK_FUNC_TO){ fprintf(stderr,"안보 경고: FUNC_TO 누락\n"); repl_or_exit();} p->i++;
     expect_op(p,"(");
     Node *params=nn(N_LIST);
     while(!is_op(p,")",0)){ Node *pn=nn(N_ID); pn->s=expect_ident(p); kids_push(params,pn); if(!eat_op(p,","))break; }
@@ -704,15 +709,7 @@ static char *read_source(const char *path){
     return (char*)buf;
 }
 
-int main(int argc, char **argv){
-    V_NIL.t=T_NIL;
-    if(argc<2){ fprintf(stderr,"사용법: ssvm <파일.ㄹ>\n"); return 2; }
-    const char *seed=getenv("GNE_SEED"); srand(seed?(unsigned)atoi(seed):(unsigned)time(NULL));
-    char *src=read_source(argv[1]); if(!src)return 2;
-
-    TokList tl={0}; lex(src,&tl);
-    Parser p={tl.toks,0,0}; Node *prog=parse_program(&p);
-
+static void setup_globals(void){
     g_globals=env_new(NULL);
     /* 콘솔 네임스페이스 (실제 디스패치는 N_CALL에서 처리하지만 참조 가능하게) */
     { NS *ns=xmalloc(sizeof(NS)); ns->entries=NULL; Value v; v.t=T_NS; v.u.ns=ns; env_define(g_globals,"\xec\xbd\x98\xec\x86\x94",v); }
@@ -720,7 +717,74 @@ int main(int argc, char **argv){
     { Value v; v.t=T_BUILTIN; v.u.bi=bi_minwon; env_define(g_globals,"\xeb\xaf\xbc\xec\x9b\x90",v); }
     const char *consts[]={"\xec\xb5\x9c\xec\x88\x9c\xec\x8b\xa4","\xed\x9d\x99\xec\x88\x98\xec\xa0\x80","\xea\xb8\x88\xec\x88\x98\xec\xa0\x80","\xec\x8a\xb9\xeb\xa7\x88\xec\x84\xa0\xec\x88\x98","\xec\x9d\xb8\xed\x84\xb4",0};
     for(int k=0;consts[k];k++) env_define(g_globals,consts[k],mkstr(consts[k]));
+}
 
+/* 입력이 완결됐는지(괄호 균형 + 문자열/주석 미종료 아님) 검사 */
+static int input_complete(const char *s){
+    int depth=0, n=(int)strlen(s);
+    for(int i=0;i<n;i++){
+        char c=s[i];
+        if(c=='"'||c=='\''){ char q=c; i++; while(i<n&&s[i]!=q){ if(s[i]=='\\')i++; i++; } if(i>=n) return 0; continue; }
+        if(c=='/'&&s[i+1]=='/'){ while(i<n&&s[i]!='\n')i++; continue; }
+        if(c=='/'&&s[i+1]=='*'){ i+=2; while(i<n&&!(s[i]=='*'&&s[i+1]=='/'))i++; if(i>=n) return 0; i++; continue; }
+        if(c=='/'){ int m=is_lda(s,i+1); if(m){ i+=1+m; int closed=0; while(i<n){ int e=is_lda(s,i); if(e&&s[i+e]=='/'){ i+=e; closed=1; break; } i++; } if(!closed) return 0; continue; } }
+        if(c=='('||c=='{'||c=='[') depth++;
+        else if(c==')'||c=='}'||c==']') depth--;
+    }
+    return depth<=0;
+}
+
+static void repl_exec_chunk(const char *src){
+    TokList tl={0}; lex(src,&tl);
+    Parser p={tl.toks,0,0}; Node *prog=parse_program(&p);
+    hoist(prog,g_globals);
+    for(int k=0;k<prog->nkids;k++){
+        Node *s=prog->kids[k];
+        if(s->kind==N_FUNC||s->kind==N_CLASS||s->kind==N_NOOP) continue;
+        if(s->kind==N_EXPRSTMT && s->a->kind!=N_ASSIGN){
+            Value v=eval(s->a,g_globals);
+            if(v.t!=T_NIL){ char *str=show(v); printf("%s\n",str); }
+        } else {
+            exec_node(s,g_globals);
+        }
+    }
+}
+
+static void repl(void){
+    g_repl=1;
+    setup_globals();
+    printf("준비된 한국형 대화창 — SSVM(순실VM) REPL. 종료하려면 '고심 끝에 프로세스 해체' 또는 Ctrl-D.\n");
+    char *acc=xstrdup(""); int cont=0; char line[4096];
+    for(;;){
+        fputs(cont?"..... ":"\xea\xb7\xb8\xeb\x84\xa4> ", stdout); fflush(stdout); /* 그네> */
+        if(!fgets(line,sizeof line,stdin)){ printf("\n고심 끝에 프로세스 해체\n"); break; }
+        char *t=xmalloc(strlen(acc)+strlen(line)+1); strcpy(t,acc); strcat(t,line); acc=t;
+        if(!input_complete(acc)){ cont=1; continue; }
+        cont=0;
+        g_nhandlers=0; g_depth=0;
+        int code=setjmp(g_toplevel);
+        if(code==0){
+            if(setjmp(g_parsejmp)==0) repl_exec_chunk(acc);
+            fflush(stdout);
+        } else if(code==2){ /* 고심 끝에 프로세스 해체 */ printf("고심 끝에 프로세스 해체\n"); break; }
+        /* code==1: 런타임 오류는 이미 출력됨. 프롬프트로 복귀 */
+        acc=xstrdup("");
+    }
+    fflush(stdout);
+}
+
+int main(int argc, char **argv){
+    V_NIL.t=T_NIL;
+    const char *seed=getenv("GNE_SEED"); srand(seed?(unsigned)atoi(seed):(unsigned)time(NULL));
+
+    int want_repl = (argc<2);
+    if(argc>=2 && (!strcmp(argv[1],"\xeb\x8c\x80\xed\x99\x94")||!strcmp(argv[1],"-i")||!strcmp(argv[1],"repl"))) want_repl=1; /* 대화 */
+    if(want_repl){ repl(); return g_exit_code; }
+
+    char *src=read_source(argv[1]); if(!src)return 2;
+    TokList tl={0}; lex(src,&tl);
+    Parser p={tl.toks,0,0}; Node *prog=parse_program(&p);
+    setup_globals();
     hoist(prog,g_globals);
     if(setjmp(g_toplevel)==0){
         for(int k=0;k<prog->nkids;k++){ Node *s=prog->kids[k]; if(s->kind==N_FUNC||s->kind==N_CLASS||s->kind==N_NOOP)continue; exec_node(s,g_globals); }

@@ -849,10 +849,84 @@ def trust_process(root="."):
     return 1 if failed else 0
 
 
+def _input_complete(src):
+    """괄호 균형 + 문자열/주석 미종료 아님 → 입력 완결."""
+    depth, i, n = 0, 0, len(src)
+    while i < n:
+        c = src[i]
+        if c in '"\'':
+            q = c
+            i += 1
+            while i < n and src[i] != q:
+                if src[i] == "\\":
+                    i += 1
+                i += 1
+            if i >= n:
+                return False
+        elif c == "/" and src[i:i + 2] == "//":
+            while i < n and src[i] != "\n":
+                i += 1
+        elif c == "/" and src[i:i + 2] == "/*":
+            end = src.find("*/", i + 2)
+            if end < 0:
+                return False
+            i = end + 1
+        elif c == "/" and i + 1 < n and src[i + 1] in "ㄹ근":
+            end = re.search(r"[ㄹ근]/", src[i + 2:])
+            if not end:
+                return False
+            i += 2 + end.end() - 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        i += 1
+    return depth <= 0
+
+
+def repl():
+    """대화형 모드. 변수·함수가 입력 사이에 유지됩니다."""
+    interp = Interpreter()
+    print("준비된 한국형 대화창 — SSVM(순실VM) REPL [파이썬]. "
+          "종료하려면 '고심 끝에 프로세스 해체' 또는 Ctrl-D.")
+    acc = ""
+    while True:
+        try:
+            line = input("..... " if acc else "그네> ")
+        except EOFError:
+            print("\n고심 끝에 프로세스 해체")
+            break
+        acc += line + "\n"
+        if not _input_complete(acc):
+            continue
+        src, acc = acc, ""
+        try:
+            stmts = Parser(tokenize(src)).parse_program()
+            interp.hoist(stmts, interp.globals)
+            for s in stmts:
+                if s[0] in ("func", "class", "noop"):
+                    continue
+                if s[0] == "expr" and s[1][0] != "assign":
+                    val = interp.ev(s[1], interp.globals)
+                    if val is not None:
+                        print(show(val))
+                else:
+                    interp.exec(s, interp.globals)
+        except ExitSignal:
+            print("고심 끝에 프로세스 해체")
+            break
+        except GNESyntaxError as e:
+            print(f"안보 경고: {e}", file=sys.stderr)
+        except GNEError as e:
+            print(f"제가 뭐라고 했습니까? {e}", file=sys.stderr)
+        except BreakSignal:
+            pass
+    return 0
+
+
 def main(argv):
-    if len(argv) < 2:
-        print("사용법: 해내겠습니다 <파일.ㄹ> | 해내겠습니다 신뢰_프로세스", file=sys.stderr)
-        return 2
+    if len(argv) < 2 or argv[1] in ("대화", "-i", "repl"):
+        return repl()
     if argv[1] == "신뢰_프로세스":
         return trust_process()
     return run_file(argv[1])
