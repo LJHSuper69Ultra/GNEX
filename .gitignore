@@ -17,3 +17,4 @@
 소통
 __pycache__/
 *.pyc
+/ssvm

@@ -1,2 +1,29 @@
 #!/bin/sh
-exec python3 "$(dirname "$0")/gne.py" "$@"
+# GNE 런타임 "해내겠습니다".
+# 개발 기반 인터프리터는 C로 작성된 SSVM(ssvm.c)입니다. gcc로 빌드하여 사용하고,
+# gcc가 없으면 순수 파이썬 구현(gne.py)으로 해내겠습니다.
+#   해내겠습니다 국정운영.ㄹ        # .ㄹ 실행 (C 기반 SSVM)
+#   해내겠습니다 신뢰_프로세스      # 대북정책_* 유닛 테스트 (파이썬)
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+# 유닛 테스트 러너는 파이썬 구현이 담당합니다.
+if [ "$1" = "신뢰_프로세스" ]; then
+    exec python3 "$DIR/gne.py" "$@"
+fi
+
+# C 기반 SSVM을 빌드(소스가 더 새로우면 다시 빌드)한 뒤 실행합니다.
+CC="${CC:-gcc}"
+BIN="$DIR/ssvm"
+if command -v "$CC" >/dev/null 2>&1; then
+    if [ ! -x "$BIN" ] || [ "$DIR/ssvm.c" -nt "$BIN" ]; then
+        if ! "$CC" -O2 -std=c11 "$DIR/ssvm.c" -o "$BIN" -lm 2>/tmp/ssvm_build.log; then
+            echo "SSVM 빌드 실패, 파이썬 구현으로 해내겠습니다:" >&2
+            cat /tmp/ssvm_build.log >&2
+            exec python3 "$DIR/gne.py" "$@"
+        fi
+    fi
+    exec "$BIN" "$@"
+fi
+
+# gcc가 없는 노오오오력이 필요한 환경: 파이썬 폴백.
+exec python3 "$DIR/gne.py" "$@"
