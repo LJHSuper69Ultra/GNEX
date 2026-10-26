@@ -14,8 +14,13 @@
 #include <math.h>
 #include <setjmp.h>
 #include <stdint.h>
+#include <stdarg.h>
+#include <ctype.h>
 #include <time.h>
 #include <iconv.h>
+#include <glob.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 /* ------------------------------------------------------------------ 공용 */
 static void *xmalloc(size_t n){ void *p=malloc(n); if(!p){fprintf(stderr,"메모리 부족: 램도 실력이야\n");exit(70);} return p; }
@@ -709,6 +714,162 @@ static char *read_source(const char *path){
     return (char*)buf;
 }
 
+/* ================================================================== JTBC: GNE -> C 트랜스파일 */
+static void setup_globals(void);
+static char *read_source(const char *path);
+typedef struct { char *p; size_t len, cap; } SB;
+static void sb_init(SB*b){ b->cap=256; b->p=xmalloc(b->cap); b->len=0; b->p[0]=0; }
+static void sb_puts(SB*b,const char*s){ size_t n=strlen(s); if(b->len+n+1>b->cap){ while(b->len+n+1>b->cap)b->cap*=2; b->p=realloc(b->p,b->cap);} memcpy(b->p+b->len,s,n+1); b->len+=n; }
+static char *jfmt(const char*f,...){ va_list ap; va_start(ap,f); int n=vsnprintf(NULL,0,f,ap); va_end(ap); char*buf=xmalloc(n+1); va_start(ap,f); vsnprintf(buf,n+1,f,ap); va_end(ap); return buf; }
+static void tfail(const char*msg){ fprintf(stderr,"JTBC 컴파일 거부: %s\n",msg); exit(2); }
+
+static char *mangle(const char*s){
+    SB b; sb_init(&b); sb_puts(&b,"g_"); size_t i=0,n=strlen(s);
+    while(i<n){ unsigned char c=(unsigned char)s[i];
+        if(c<0x80){ if(isalnum(c)||c=='_'){ char t[2]={(char)c,0}; sb_puts(&b,t);} else sb_puts(&b,jfmt("_u%04x_",c)); i++; }
+        else { int len=utf8_len(c); unsigned cp=c; if(len==2)cp=((c&0x1f)<<6)|(s[i+1]&0x3f); else if(len==3)cp=((c&0xf)<<12)|((s[i+1]&0x3f)<<6)|(s[i+2]&0x3f); else if(len==4)cp=((c&0x7)<<18)|((s[i+1]&0x3f)<<12)|((s[i+2]&0x3f)<<6)|(s[i+3]&0x3f); sb_puts(&b,jfmt("_u%04x_",cp)); i+=len; } }
+    return b.p;
+}
+static char *c_string(const char*s){ SB b; sb_init(&b); sb_puts(&b,"\""); for(;*s;s++){ unsigned char c=*s; if(c=='\\')sb_puts(&b,"\\\\"); else if(c=='"')sb_puts(&b,"\\\""); else if(c=='\n')sb_puts(&b,"\\n"); else if(c=='\t')sb_puts(&b,"\\t"); else if(c=='\r')sb_puts(&b,"\\r"); else { char t[2]={(char)c,0}; sb_puts(&b,t);} } sb_puts(&b,"\""); return b.p; }
+
+static char *t_expr(Node *n);
+static char *t_name_ref(const char *name){
+    if(!strcmp(name,"친박")) return xstrdup("gne_bool(1)");
+    if(!strcmp(name,"비박")) return xstrdup("gne_bool(0)");
+    const char *consts[]={"최순실","흙수저","금수저","승마선수","인턴",0};
+    for(int k=0;consts[k];k++) if(!strcmp(name,consts[k])) return jfmt("gne_str(%s)",c_string(name));
+    return mangle(name);
+}
+static char *t_string(Node *n){
+    if(n->nkids==1 && n->kids[0]->kind==N_STRPART_LIT) return jfmt("gne_str(%s)",c_string(n->kids[0]->s));
+    char *acc=NULL;
+    for(int k=0;k<n->nkids;k++){ Node *part=n->kids[k]; char *piece = part->kind==N_STRPART_LIT?jfmt("gne_str(%s)",c_string(part->s)):t_expr(part->a); acc=acc?jfmt("gne_cat(%s, %s)",acc,piece):piece; }
+    return acc?acc:xstrdup("gne_str(\"\")");
+}
+static char *t_bin(Node *n){
+    char *l=t_expr(n->a), *r=t_expr(n->b); const char *op=n->s;
+    if(!strcmp(op,"+")) return jfmt("gne_add(%s, %s)",l,r);
+    if(!strcmp(op,"-")) return jfmt("gne_sub(%s, %s)",l,r);
+    if(!strcmp(op,"*")) return jfmt("gne_mul(%s, %s)",l,r);
+    if(!strcmp(op,"/")) return jfmt("gne_div(%s, %s)",l,r);
+    if(!strcmp(op,"%")) return jfmt("gne_mod(%s, %s)",l,r);
+    if(!strcmp(op,"==")) return jfmt("gne_bool(gne_eq(%s, %s))",l,r);
+    if(!strcmp(op,"!=")) return jfmt("gne_bool(!gne_eq(%s, %s))",l,r);
+    if(!strcmp(op,"<")||!strcmp(op,">")||!strcmp(op,"<=")||!strcmp(op,">=")) return jfmt("gne_bool(gne_asnum(%s) %s gne_asnum(%s))",l,op,r);
+    if(!strcmp(op,"&&")) return jfmt("gne_bool(gne_truthy(%s) && gne_truthy(%s))",l,r);
+    if(!strcmp(op,"||")) return jfmt("gne_bool(gne_truthy(%s) || gne_truthy(%s))",l,r);
+    tfail("알 수 없는 연산자"); return NULL;
+}
+static char *t_expr(Node *n){
+    switch(n->kind){
+        case N_NUM:{ if(n->isint) return jfmt("gne_num(%lld.0)",n->inum); char buf[64]; snprintf(buf,sizeof buf,"%.17g",n->dnum); if(!strpbrk(buf,".eE")){ strcat(buf,".0"); } return jfmt("gne_num(%s)",buf); }
+        case N_BOOL: return jfmt("gne_bool(%d)",n->bval?1:0);
+        case N_ID: return t_name_ref(n->s);
+        case N_STR: return t_string(n);
+        case N_UN: if(!strcmp(n->s,"!")) return jfmt("gne_bool(!gne_truthy(%s))",t_expr(n->a)); return jfmt("gne_num(-gne_asnum(%s))",t_expr(n->a));
+        case N_BIN: return t_bin(n);
+        case N_ASSIGN:{ if(n->a->kind!=N_ID) tfail("JTBC는 변수에만 대입할 수 있습니다 (멤버/인덱스 미지원)"); return jfmt("(%s = %s)",t_name_ref(n->a->s),t_expr(n->b)); }
+        case N_CALL:{
+            Node *callee=n->a;
+            if(callee->kind==N_MEMBER){
+                if(callee->a->kind==N_ID && !strcmp(callee->a->s,"콘솔") && !strcmp(callee->s,"로그")){
+                    SB b; sb_init(&b); sb_puts(&b,jfmt("gne_log(%d",n->b->nkids)); for(int k=0;k<n->b->nkids;k++){ sb_puts(&b,", "); sb_puts(&b,t_expr(n->b->kids[k])); } sb_puts(&b,")"); return b.p;
+                }
+                tfail("JTBC는 아직 멤버 호출을 지원하지 않습니다 (콘솔.로그 제외)");
+            }
+            if(callee->kind==N_ID){
+                const char *nm=callee->s;
+                if(!strcmp(nm,"오방낭")) return n->b->nkids==0?xstrdup("gne_obang_none()"):jfmt("gne_obang(%s)",t_expr(n->b->kids[0]));
+                if(!strcmp(nm,"민원")) return n->b->nkids==0?xstrdup("gne_minwon(gne_nil())"):jfmt("gne_minwon(%s)",t_expr(n->b->kids[0]));
+                SB b; sb_init(&b); sb_puts(&b,jfmt("%s(",mangle(nm))); for(int k=0;k<n->b->nkids;k++){ if(k)sb_puts(&b,", "); sb_puts(&b,t_expr(n->b->kids[k])); } sb_puts(&b,")"); return b.p;
+            }
+            tfail("JTBC는 이름으로만 함수를 호출할 수 있습니다"); return NULL;
+        }
+        case N_MEMBER: tfail("JTBC는 아직 멤버 접근(.)을 지원하지 않습니다"); return NULL;
+        case N_INDEX: tfail("JTBC는 아직 배열 인덱스를 지원하지 않습니다"); return NULL;
+        case N_NEW: tfail("JTBC는 아직 창조 객체를 지원하지 않습니다"); return NULL;
+        case N_PROXY: tfail("JTBC는 아직 프록시(비선)를 지원하지 않습니다"); return NULL;
+        case N_LIST: tfail("JTBC는 아직 리스트를 지원하지 않습니다"); return NULL;
+        default: tfail("JTBC가 모르는 표현입니다"); return NULL;
+    }
+}
+static void t_pad(SB *b,int ind){ for(int k=0;k<ind;k++) sb_puts(b,"    "); }
+static void t_stmt(SB *b, Node *s, int ind, int in_func);
+static void t_block_body(SB *b, Node *blk, int ind, int in_func){ for(int k=0;k<blk->nkids;k++) t_stmt(b,blk->kids[k],ind,in_func); }
+static void t_stmt_as_block(SB *b, Node *s, int ind, int in_func){ if(s->kind==N_BLOCK) t_block_body(b,s,ind,in_func); else t_stmt(b,s,ind,in_func); }
+static void t_stmt(SB *b, Node *s, int ind, int in_func){
+    switch(s->kind){
+        case N_VAR: if(s->bval) tfail("JTBC는 아직 배열을 지원하지 않습니다"); t_pad(b,ind); sb_puts(b,jfmt("Value %s = %s;\n",mangle(s->s),s->a?t_expr(s->a):"gne_nil()")); break;
+        case N_EXPRSTMT: t_pad(b,ind); sb_puts(b,jfmt("%s;\n",t_expr(s->a))); break;
+        case N_BLOCK: t_pad(b,ind); sb_puts(b,"{\n"); t_block_body(b,s,ind+1,in_func); t_pad(b,ind); sb_puts(b,"}\n"); break;
+        case N_IF: t_pad(b,ind); sb_puts(b,jfmt("if (gne_truthy(%s)) {\n",t_expr(s->a))); t_stmt_as_block(b,s->b,ind+1,in_func); t_pad(b,ind); sb_puts(b,"}\n"); if(s->c){ t_pad(b,ind); sb_puts(b,"else {\n"); t_stmt_as_block(b,s->c,ind+1,in_func); t_pad(b,ind); sb_puts(b,"}\n"); } break;
+        case N_WHILE: t_pad(b,ind); sb_puts(b,jfmt("while (gne_truthy(%s)) {\n",t_expr(s->a))); t_stmt_as_block(b,s->b,ind+1,in_func); t_pad(b,ind); sb_puts(b,"}\n"); break;
+        case N_BREAK: t_pad(b,ind); sb_puts(b,"break;\n"); break;
+        case N_RETURN: t_pad(b,ind); if(in_func) sb_puts(b,jfmt("return %s;\n",s->a?t_expr(s->a):"gne_nil()")); else sb_puts(b,"return;\n"); break;
+        case N_EXIT: t_pad(b,ind); sb_puts(b,"exit(0);\n"); break;
+        case N_TRACE: t_pad(b,ind); sb_puts(b,jfmt("fprintf(stderr, \"[추적] 줄 %%d\\n\", %d);\n",s->line)); break;
+        case N_BP: t_pad(b,ind); sb_puts(b,jfmt("fprintf(stderr, \"[메르스] 줄 %%d\\n\", %d);\n",s->line)); break;
+        case N_GC: case N_NOOP: break;
+        case N_TRY: tfail("JTBC는 아직 예외처리를 지원하지 않습니다. 해내겠습니다(인터프리터)로 실행하십시오"); break;
+        case N_FUNC: tfail("JTBC는 중첩 함수를 지원하지 않습니다"); break;
+        case N_CLASS: tfail("JTBC는 아직 창조 객체(사람/병원 등)를 지원하지 않습니다. 해내겠습니다로 실행하십시오"); break;
+        default: tfail("JTBC가 모르는 문장입니다"); break;
+    }
+}
+static char *transpile(Node *prog){
+    for(int k=0;k<prog->nkids;k++) if(prog->kids[k]->kind==N_CLASS) tfail("JTBC는 아직 창조 객체(사람/병원 등)를 지원하지 않습니다. 해내겠습니다로 실행하십시오");
+    SB protos; sb_init(&protos);
+    SB funcs; sb_init(&funcs);
+    SB mains; sb_init(&mains);
+    for(int k=0;k<prog->nkids;k++){ Node *s=prog->kids[k]; if(s->kind!=N_FUNC)continue;
+        SB sig; sb_init(&sig); for(int j=0;j<s->b->nkids;j++){ if(j)sb_puts(&sig,", "); sb_puts(&sig,jfmt("Value %s",mangle(s->b->kids[j]->s))); }
+        sb_puts(&protos,jfmt("static Value %s(%s);\n",mangle(s->s),s->b->nkids?sig.p:"void")); }
+    for(int k=0;k<prog->nkids;k++){ Node *s=prog->kids[k];
+        if(s->kind==N_FUNC){ SB sig; sb_init(&sig); for(int j=0;j<s->b->nkids;j++){ if(j)sb_puts(&sig,", "); sb_puts(&sig,jfmt("Value %s",mangle(s->b->kids[j]->s))); }
+            sb_puts(&funcs,jfmt("static Value %s(%s) {\n",mangle(s->s),s->b->nkids?sig.p:"void")); t_block_body(&funcs,s->a,1,1); sb_puts(&funcs,"    return gne_nil();\n}\n\n"); }
+        else if(s->kind==N_MAIN||s->kind==N_GAME){ if(s->kind==N_GAME) sb_puts(&mains,jfmt("    gne_log(1, gne_str(%s));\n",c_string(GAME_WARNING))); t_block_body(&mains,s->a,1,0); }
+        else if(s->kind==N_NOOP){}
+        else tfail("최상위에는 사회/질병/함수만 올 수 있습니다");
+    }
+    SB out; sb_init(&out);
+    sb_puts(&out,"/* JTBC(Joseon Turbo Boost Compiler)가 생성한 C 소스 — 투명한 컴파일(진상규명) */\n");
+    sb_puts(&out,"#include \"gne_rt.h\"\n\n");
+    if(protos.len){ sb_puts(&out,protos.p); sb_puts(&out,"\n"); }
+    sb_puts(&out,funcs.p);
+    sb_puts(&out,"int main(void) {\n    gne_seed();\n");
+    sb_puts(&out,mains.p);
+    sb_puts(&out,"    return 0;\n}\n");
+    return out.p;
+}
+
+/* ================================================================== 실행/테스트 */
+static int run_program(char *src){
+    TokList tl={0}; lex(src,&tl);
+    Parser p={tl.toks,0,0}; Node *prog=parse_program(&p);
+    setup_globals();
+    hoist(prog,g_globals);
+    g_exit_code=0;
+    if(setjmp(g_toplevel)==0){
+        for(int k=0;k<prog->nkids;k++){ Node *s=prog->kids[k]; if(s->kind==N_FUNC||s->kind==N_CLASS||s->kind==N_NOOP)continue; exec_node(s,g_globals); }
+    }
+    fflush(stdout);
+    return g_exit_code;
+}
+static int trust_process(void){
+    glob_t g; int rc=glob("대북정책_*",0,NULL,&g);
+    if(rc!=0 || g.gl_pathc==0){ printf("대북정책이 없습니다. 신뢰를 쌓을 수 없습니다.\n"); return 1; }
+    int failed=0;
+    for(size_t i=0;i<g.gl_pathc;i++){
+        fflush(stdout);
+        pid_t pid=fork();
+        if(pid==0){ char *src=read_source(g.gl_pathv[i]); int code=src?run_program(src):2; fflush(stdout); _exit(code); }
+        int st; waitpid(pid,&st,0); int code=WIFEXITED(st)?WEXITSTATUS(st):1;
+        printf("%s %s\n", code==0?"신뢰":"종북", g.gl_pathv[i]); if(code)failed++;
+    }
+    printf("%zu/%zu 신뢰 구축 완료\n", g.gl_pathc-failed, g.gl_pathc);
+    return failed?1:0;
+}
+
 static void setup_globals(void){
     g_globals=env_new(NULL);
     /* 콘솔 네임스페이스 (실제 디스패치는 N_CALL에서 처리하지만 참조 가능하게) */
@@ -777,18 +938,17 @@ int main(int argc, char **argv){
     V_NIL.t=T_NIL;
     const char *seed=getenv("GNE_SEED"); srand(seed?(unsigned)atoi(seed):(unsigned)time(NULL));
 
+    if(argc>=2 && !strcmp(argv[1],"\xec\x8b\xa0\xeb\xa2\xb0_\xed\x94\x84\xeb\xa1\x9c\xec\x84\xb8\xec\x8a\xa4")) return trust_process(); /* 신뢰_프로세스 */
+    if(argc>=3 && !strcmp(argv[1],"--emit-c")){
+        char *src=read_source(argv[2]); if(!src)return 2;
+        TokList tl={0}; lex(src,&tl); Parser p={tl.toks,0,0}; Node *prog=parse_program(&p);
+        fputs(transpile(prog),stdout); return 0;
+    }
+
     int want_repl = (argc<2);
     if(argc>=2 && (!strcmp(argv[1],"\xeb\x8c\x80\xed\x99\x94")||!strcmp(argv[1],"-i")||!strcmp(argv[1],"repl"))) want_repl=1; /* 대화 */
     if(want_repl){ repl(); return g_exit_code; }
 
     char *src=read_source(argv[1]); if(!src)return 2;
-    TokList tl={0}; lex(src,&tl);
-    Parser p={tl.toks,0,0}; Node *prog=parse_program(&p);
-    setup_globals();
-    hoist(prog,g_globals);
-    if(setjmp(g_toplevel)==0){
-        for(int k=0;k<prog->nkids;k++){ Node *s=prog->kids[k]; if(s->kind==N_FUNC||s->kind==N_CLASS||s->kind==N_NOOP)continue; exec_node(s,g_globals); }
-    }
-    fflush(stdout);
-    return g_exit_code;
+    return run_program(src);
 }
