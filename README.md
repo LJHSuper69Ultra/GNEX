@@ -1,5 +1,3 @@
-![SSVM](ssvm.png)
-
 # GNE
 준비된 한국형 언어
 
