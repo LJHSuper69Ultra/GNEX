@@ -5,6 +5,7 @@
 """
 import glob
 import os
+import random
 import re
 import sys
 
@@ -19,6 +20,11 @@ SECURITY_WARNING = (
 )
 GMAIL_WARNING = "안보 경고: Gmail을 사용하는 사람은 종북세력입니다. 믿을 수 있는 샵메일을 대신 사용하십시오."
 BAD_VARIABLE = "나쁜 변수이더라"
+GAME_WARNING = (
+    "질병관리본부 격리 경고: 게임은 마약이자 질병입니다. 하지만 질병도 호환해야 국가경쟁력을 "
+    "강화할 수 있으므로, 온 우주의 기운을 모아 격리 모드로 이 질병을 실행합니다. "
+    "게임 중독은 더불어민주당이 책임져야 합니다."
+)
 
 
 class GNEError(Exception):
@@ -67,6 +73,7 @@ RESERVED = {
     "친박": "TRUE", "비박": "FALSE", "사회": "MAIN", "공천": "VAR",
     "사람": "CLASS", "바이러스": "CLASS", "병원": "CLASS", "책": "CLASS",
     "입당": "IMPORT", "출당": "IMPORT", "더하기": "PLUS",
+    "질병": "GAME", "게임": "GAME",
 }
 # 동치 관계: ㄹ=근, 법=목욕탕, 누에=나비
 ALIASES = {"근": "ㄹ", "목욕탕": "법", "나비": "누에"}
@@ -216,6 +223,11 @@ class Parser:
             if self.peek()[0] == "ident":
                 self.next()
             return ("main", self.parse_block())
+        elif typ == "GAME":
+            self.next()
+            if self.peek()[0] == "ident":
+                self.next()
+            return ("game", self.parse_block())
         elif typ == "FUNC":
             return self.parse_func()
         elif typ == "VAR":
@@ -556,10 +568,35 @@ class Interpreter:
         self.out = out or sys.stdout
         self.globals = Env()
         self.classes = {}
+        seed = os.environ.get("GNE_SEED")
+        if seed is not None:
+            random.seed(int(seed))  # 오방낭 점괘를 재현 가능하게 (테스트용)
         g = self.globals.vars
         g["콘솔"] = Namespace(로그=self.log)
+        g["오방낭"] = self.obang      # 샤머니즘 난수 생성기 (우주의 기운)
+        g["민원"] = self.minwon       # 국민의 입력을 접수
         for name in ("최순실", "흙수저", "금수저", "승마선수", "인턴"):
             g[name] = name
+
+    def obang(self, *a):
+        """오방낭에서 기운을 뽑는다. 인자가 있으면 0..n-1 정수, 없으면 0..1 실수."""
+        if not a:
+            return random.random()
+        n = int(num(a[0]))
+        return random.randrange(n) if n > 0 else 0
+
+    def minwon(self, *a):
+        """국민의 민원(입력)을 한 줄 접수한다. 숫자면 수로, 아니면 문자열로."""
+        if a:
+            print(show(a[0]), end="", file=self.out)
+            self.out.flush()
+        try:
+            line = input().strip()
+        except EOFError:
+            # 더 이상 접수할 민원이 없으면 고심 끝에 프로세스 해체.
+            print("[민원실] 접수할 민원이 없어 창구를 닫습니다.", file=sys.stderr)
+            raise ExitSignal()
+        return int(line) if re.fullmatch(r"-?\d+", line) else line
 
     def log(self, *args):
         print(" ".join(show(a) for a in args), file=self.out)
@@ -594,6 +631,12 @@ class Interpreter:
             inner = Env(env)
             self.hoist(body[1], inner)
             self.exec_all(body[1], inner)
+        elif kind == "game":
+            # 게임은 질병이라 격리 모드로만 호환합니다.
+            self.log(GAME_WARNING)
+            inner = Env(env)
+            self.hoist(s[1][1], inner)
+            self.exec_all(s[1][1], inner)
         elif kind == "if":
             if self.ev(s[1], env):
                 self.exec(s[2], env)
