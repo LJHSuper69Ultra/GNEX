@@ -1,0 +1,45 @@
+#!/bin/sh
+# JTBC — Joseon Turbo Boost Compiler. 전부 C 기반입니다.
+# 그네(.ㄹ)를 C언어로 투명하게 컴파일(진상규명)하고 gcc로 네이티브 사회를 짓습니다.
+# 프런트엔드(렉서/파서)는 C로 작성된 ssvm이 담당하며, --emit-c 로 C 소스를 생성합니다.
+#   JTBC 파일.ㄹ            C로 컴파일 후 바로 실행
+#   JTBC 파일.ㄹ -o 사회    네이티브 실행 파일로 컴파일
+#   JTBC 파일.ㄹ -c         생성된 C 소스를 화면에 출력 (진상규명)
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+CC="${CC:-gcc}"
+BIN="$DIR/ssvm"
+
+if ! command -v "$CC" >/dev/null 2>&1; then
+    echo "JTBC는 C 컴파일러가 필요합니다. 노오오오력을 통해 '$CC'를 설치하십시오." >&2; exit 1
+fi
+if [ ! -x "$BIN" ] || [ "$DIR/ssvm.c" -nt "$BIN" ]; then
+    "$CC" -O2 -std=c11 "$DIR/ssvm.c" -o "$BIN" -lm || { echo "SSVM 빌드 실패" >&2; exit 1; }
+fi
+
+FILE=""; OUT=""; EMIT=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c) EMIT=1 ;;
+        -o) shift; OUT="$1" ;;
+        *) FILE="$1" ;;
+    esac
+    shift
+done
+if [ -z "$FILE" ]; then echo "사용법: JTBC 파일.ㄹ [-o 사회 | -c]" >&2; exit 2; fi
+
+if [ "$EMIT" = 1 ]; then
+    exec "$BIN" --emit-c "$FILE"
+fi
+
+TMP="$(mktemp /tmp/jtbc_XXXXXX.c)"
+if ! "$BIN" --emit-c "$FILE" > "$TMP"; then rm -f "$TMP"; exit 2; fi
+RUN=0
+if [ -z "$OUT" ]; then OUT="$(mktemp /tmp/jtbc_bin_XXXXXX)"; RUN=1; fi
+if ! "$CC" -O2 -std=c11 -I"$DIR" "$TMP" -o "$OUT" -lm; then
+    echo "JTBC: gcc 컴파일 실패" >&2; rm -f "$TMP"; exit 1
+fi
+rm -f "$TMP"
+if [ "$RUN" = 1 ]; then
+    "$OUT"; code=$?; rm -f "$OUT"; exit $code
+fi
+echo "JTBC: 사회를 지었습니다 -> $OUT"

@@ -1,0 +1,22 @@
+#!/bin/sh
+# GNE 런타임 "해내겠습니다". 전부 C 기반입니다.
+# C로 작성된 SSVM(ssvm.c)을 gcc로 빌드하여 실행합니다.
+#   해내겠습니다 국정운영.ㄹ        # .ㄹ 실행 (C 기반 SSVM 인터프리터)
+#   해내겠습니다                    # 대화형 REPL
+#   해내겠습니다 대화               # 대화형 REPL (명시)
+#   해내겠습니다 신뢰_프로세스      # 대북정책_* 유닛 테스트
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+CC="${CC:-gcc}"
+BIN="$DIR/ssvm"
+
+if ! command -v "$CC" >/dev/null 2>&1; then
+    echo "GNE는 순수 한국의 C 기술로 만든 언어입니다. 빌드하려면 '$CC'가 필요합니다." >&2
+    echo "노오오오력을 통해 C 컴파일러를 설치하십시오." >&2
+    exit 1
+fi
+if [ ! -x "$BIN" ] || [ "$DIR/ssvm.c" -nt "$BIN" ]; then
+    if ! "$CC" -O2 -std=c11 "$DIR/ssvm.c" -o "$BIN" -lm 2>/tmp/ssvm_build.log; then
+        echo "SSVM 빌드 실패:" >&2; cat /tmp/ssvm_build.log >&2; exit 1
+    fi
+fi
+exec "$BIN" "$@"
